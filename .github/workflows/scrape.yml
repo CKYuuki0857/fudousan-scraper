@@ -1,0 +1,21 @@
+name: 抓實價登錄
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: '5168 社區網址'
+        required: true
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests beautifulsoup4
+      - run: python scraper.py "${{ github.event.inputs.url }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: records
+          path: records.json
