@@ -2,26 +2,30 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
- 房產戰情室 · 實價登錄抓取器 v3（交叉比對版）
+ 房產戰情室 · 實價登錄抓取器 v4（5168 純淨版）
  永慶不動產 西屯安和創意店 · 李仕揚 · 0968-880183
 ------------------------------------------------------------
- v3 新增：5168(主) × 樂居(副) 交叉比對
-   配對規則：同成交月 + 同樓層 + 坪數±0.5 + 總價±2%
-   每筆標記：✓雙源一致 / ⚠僅5168 / ⚠僅樂居 / ✗價格不符(需人工核對)
-   建議：只採「雙源一致」「僅5168」(5168最可靠)；
-        「價格不符」會同時列出兩邊價格供你判斷。
+ v4 改版重點（拿掉樂居 / Selenium，把 5168 做到最順）：
+   ✓ 搜尋會「列候選清單」讓你挑，不會抓錯同名社區（惟美、昂峰…）
+   ✓ 全程免瀏覽器、免 webdriver —— 純 requests，貼了就跑
+   ✓ 跑完自動「複製到剪貼簿」（需 pip install pyperclip；沒裝就改成終端機列出）
+   ✓ 同時輸出兩份：
+       records_社區名_日期.json  ←（存檔備查）
+       records.json              ←（雲端 / 自動化固定名，不會被改名）
+   ✓ 跑完印一張「摘要」：筆數 / 單價中位數 / 樓層分布 / 最近成交月
+   ✓ 桌機、手機、雲端共用同一支：給參數(網址或 .csv)＝直接跑、不進選單（GitHub Actions 用）
 ------------------------------------------------------------
  模式：
-   1) 5168 社區名自動抓（最方便）
-   2) 5168 社區網址抓
-   3) 內政部 OpenData CSV（最穩、整批）
-   4) 5168 × 樂居 交叉比對  ← v3 重點
-   5) 純樂居（Selenium）
+   【日常 · 5168 貼了就跑】
+     1) 社區名搜尋（會列候選給你挑）
+     2) 社區網址直接抓
+   【整批 · 內政部（要先自己下載 CSV）】
+     3) 內政部 OpenData CSV
  安裝：pip install requests beautifulsoup4
-       交叉比對/樂居另需：pip install selenium webdriver-manager + Chrome
+       （選用）pip install pyperclip   ← 裝了才能「自動複製到剪貼簿」
 ============================================================
 """
-import os, sys, re, json, csv, time, datetime, urllib.parse, warnings
+import os, sys, re, json, csv, datetime, urllib.parse, warnings
 
 try:
     import requests
@@ -38,6 +42,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8"}
 
+# ======================= 共用小工具 =======================
 def num(x):
     try: return float(re.sub(r'[^\d.\-]', '', str(x)))
     except: return 0.0
@@ -68,7 +73,7 @@ def fetch(url):
     r.encoding=r.apparent_encoding or 'utf-8'
     return r.status_code, r.text
 
-# ========== 5168 / houseprice （requests，已測準） ==========
+# ============== 5168 / houseprice 解析（沿用 v3 已測準，未更動） ==============
 def parse_houseprice_text(text):
     out=[]; matches=list(re.finditer(r'(\d{3})年(\d{1,2})月', text))
     for k,m in enumerate(matches):
@@ -94,22 +99,51 @@ def scrape_houseprice_url(url):
     out=parse_houseprice_text(BeautifulSoup(html,"html.parser").get_text(" "))
     print(f"   ✅ 解析出 {len(out)} 筆"); return out
 
-def search_houseprice(name, city, district=""):
-    url="https://community.houseprice.tw/list/"+urllib.parse.quote(city)+"_city/"
-    if district: url+=urllib.parse.quote(district)+"_zip/"
-    url+=urllib.parse.quote(name)+"_kw/"
-    print(f"\n🔎 搜尋社區：{url}")
-    code,html=fetch(url)
-    if code!=200: return None
-    m=re.search(r'/building/(\d+)',html)
-    if m:
-        bu=f"https://community.houseprice.tw/building/{m.group(1)}/"; print(f"   ✅ 命中：{bu}"); return bu
-    print("   ⚠️ 沒找到，換關鍵字或加區。"); return None
+# ============== 5168 搜尋：改成「列候選清單」（修掉抓錯同名社區的風險） ==============
+def search_houseprice_candidates(name, city, district="", limit=8):
+    base="https://community.houseprice.tw/list/"+urllib.parse.quote(city)+"_city/"
+    if district: base+=urllib.parse.quote(district)+"_zip/"
+    base+=urllib.parse.quote(name)+"_kw/"
+    print(f"\n🔎 搜尋：{base}")
+    code,html=fetch(base)
+    if code!=200: print(f"   ❌ HTTP {code}，搜尋頁取得失敗。"); return []
+    soup=BeautifulSoup(html,"html.parser")
+    seen=set(); cands=[]
+    for a in soup.find_all('a', href=True):
+        m=re.search(r'/building/(\d+)', a['href'])
+        if not m: continue
+        bid=m.group(1)
+        if bid in seen: continue
+        seen.add(bid)
+        label=re.sub(r'\s+',' ', a.get_text(' ', strip=True))[:40]
+        cands.append({'id':bid, 'name':label,
+                      'url':f"https://community.houseprice.tw/building/{bid}/"})
+        if len(cands)>=limit: break
+    return cands
 
 def houseprice_by_name(name, city, district=""):
-    bu=search_houseprice(name,city,district); return scrape_houseprice_url(bu) if bu else []
+    """回傳 (records, 社區名標籤)。多筆會列清單讓使用者挑。"""
+    cands=search_houseprice_candidates(name, city, district)
+    if not cands:
+        print("   ⚠️ 沒找到，換個關鍵字或加上行政區再試。"); return [], name
+    if len(cands)==1:
+        c=cands[0]; print(f"   ✅ 只有一筆，直接抓：{c['name'] or c['url']}")
+        return scrape_houseprice_url(c['url']), (c['name'] or name)
+    print(f"\n   找到 {len(cands)} 個社區：")
+    for i,c in enumerate(cands,1):
+        print(f"     {i}) {c['name'] or '(無名稱)'}   {c['url']}")
+    sel=input("   選哪個？輸入編號（預設 1，輸 0 取消）：").strip() or "1"
+    if sel=="0":
+        print("   已取消。"); return [], name
+    try:
+        idx=int(sel)-1
+        if not (0<=idx<len(cands)): raise ValueError
+    except ValueError:
+        print("   編號不對，改抓第 1 個。"); idx=0
+    c=cands[idx]
+    return scrape_houseprice_url(c['url']), (c['name'] or name)
 
-# ========== 內政部 OpenData CSV ==========
+# ============== 內政部 OpenData CSV（沿用 v3，未更動） ==============
 def minguo_date_csv(s):
     if s is None: return ""
     d=re.sub(r'\D','',str(s))
@@ -156,122 +190,117 @@ def parse_moi_csv(path):
                        land=(num(r[ci['land']])*PING) if ci['land']>=0 else 0))
     print(f"   ✅ 解析出 {len(out)} 筆"); return out
 
-# ========== 樂居（Selenium 真瀏覽器） ==========
-def parse_leju_html(html):
-    soup=BeautifulSoup(html,"html.parser"); out=[]
-    for tr in soup.select('tr.tr-item'):
-        td=tr.find_all('td')
-        if len(td)<7: continue
-        g=lambda i: td[i].get_text(' ',strip=True) if i<len(td) else ""
-        dm=re.search(r'(\d{2,3})\D+(\d{1,2})', re.sub(r'[.\-]','/',g(0)))
-        mon=f"{int(dm.group(1))}/{int(dm.group(2)):02d}" if dm else ""
-        out.append(rec(mon=mon, fl=floor_of(g(2)), age=num(g(3)), tp=num(g(4)), ta=num(g(6)),
-                       cp=num(g(8)) if len(td)>8 else 0, ca=0))
-    return out
+# ======================= 摘要 =======================
+def _unit_price(r):
+    """房屋單價（萬/坪）＝（總價 − 車位價）/（建物坪 − 車位坪），不含車位。"""
+    tp=r.get('tp',0); cp=r.get('cp',0); ta=r.get('ta',0); ca=r.get('ca',0)
+    net_tp = tp-cp if (cp and 0<cp<tp) else tp
+    net_ta = ta-ca if (ca and 0<ca<ta) else ta
+    return (net_tp/net_ta) if net_ta>0 else 0
 
-def scrape_leju(url):
+def _mon_key(m):
+    mm=re.match(r'(\d+)\D+(\d+)', m or '')
+    return (int(mm.group(1)), int(mm.group(2))) if mm else (-1,-1)
+
+def _median(xs):
+    xs=sorted(xs); n=len(xs)
+    if n==0: return 0
+    return xs[n//2] if n%2 else (xs[n//2-1]+xs[n//2])/2
+
+def summary(records):
+    if not records: return
+    ups=[u for u in (_unit_price(r) for r in records) if u>0]
+    months=[r.get('mon','') for r in records if _mon_key(r.get('mon',''))!=(-1,-1)]
+    b1=b2=b3=b0=0
+    for r in records:
+        f=r.get('fl',0)
+        if   1<=f<=5:  b1+=1
+        elif 6<=f<=10: b2+=1
+        elif f>=11:    b3+=1
+        else:          b0+=1
+    print("\n" + "─"*48)
+    print(f"📊 摘要（共 {len(records)} 筆）")
+    if ups:
+        print(f"   單價中位數：{_median(ups):.1f} 萬/坪（扣車位）   區間 {min(ups):.1f}–{max(ups):.1f}")
+    if months:
+        print(f"   成交月：最近 {max(months,key=_mon_key)}   最早 {min(months,key=_mon_key)}")
+    print(f"   樓層分布：1–5F {b1} ｜ 6–10F {b2} ｜ 11F+ {b3} ｜ 其他 {b0}")
+    print("─"*48)
+
+# ======================= 剪貼簿 =======================
+def copy_clip(text):
+    """有裝 pyperclip 就自動複製；沒裝就回 False（改走終端機列出，不會塞亂碼進剪貼簿）。"""
     try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.service import Service
-        from selenium.webdriver.chrome.options import Options
-        from webdriver_manager.chrome import ChromeDriverManager
-    except ImportError:
-        print("   ❌ 樂居需： pip install selenium webdriver-manager"); return []
-    print(f"\n🌍 開瀏覽器（樂居）：{url}")
-    driver=webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=Options())
-    try:
-        driver.get(url)
-        print("🛑 請在瀏覽器登入/關廣告/捲到成交明細，完成後回來按 Enter…"); input("   (Enter 繼續)")
-        for y in (600,1400,2400): driver.execute_script(f"window.scrollTo(0,{y});"); time.sleep(1.2)
-        html=driver.page_source
-    finally:
-        try: driver.quit()
-        except: pass
-    out=parse_leju_html(html); print(f"   ✅ 樂居解析 {len(out)} 筆（請人工核對單價）"); return out
+        import pyperclip; pyperclip.copy(text); return True
+    except Exception:
+        return False
 
-# ========== ★ 交叉比對核心 ★ ==========
-def cross_compare(a, b, tol_area=0.5, tol_tp=0.02):
-    """a=5168(主) b=樂居(副)。配對 by 同月+同樓層+坪數±tol_area+總價±tol_tp。"""
-    used=set(); out=[]
-    cnt={'ok':0,'a_only':0,'b_only':0,'price':0}
-    for ra in a:
-        hit=None
-        for j,rb in enumerate(b):
-            if j in used: continue
-            if ra['mon']!=rb['mon']: continue
-            if ra['fl'] and rb['fl'] and ra['fl']!=rb['fl']: continue
-            if abs(ra['ta']-rb['ta'])>tol_area: continue
-            if ra['tp']>0 and rb['tp']>0:
-                diff=abs(ra['tp']-rb['tp'])/max(ra['tp'],rb['tp'])
-                hit=(j, 'ok' if diff<=tol_tp else 'price'); break
-        r=dict(ra)
-        if hit:
-            used.add(hit[0])
-            if hit[1]=='ok':
-                r['src']='5168+樂居'; r['flag']='✓雙源一致'; cnt['ok']+=1
-            else:
-                r['src']='5168'; r['flag']='✗價格不符'; r['leju_tp']=b[hit[0]]['tp']; cnt['price']+=1
-        else:
-            r['src']='5168'; r['flag']='⚠僅5168'; cnt['a_only']+=1
-        out.append(r)
-    for j,rb in enumerate(b):
-        if j in used: continue
-        r=dict(rb); r['src']='樂居'; r['flag']='⚠僅樂居'; cnt['b_only']+=1; out.append(r)
-    print(f"\n📊 交叉比對結果：✓一致 {cnt['ok']} ｜⚠僅5168 {cnt['a_only']} ｜⚠僅樂居 {cnt['b_only']} ｜✗價格不符 {cnt['price']}")
-    if cnt['price']: print("   ⚠️ 有價格不符的筆數，已標記並附上樂居價(leju_tp)，請人工核對後再採用。")
-    return out
+# ======================= 檔名 / 輸出 =======================
+def safe_name(s):
+    s=re.sub(r'[\\/:*?"<>|，、\s]+','_', (s or '').strip()).strip('_')
+    return s or 'records'
 
-# ========== 輸出 ==========
-def output(records, compared=False):
-    if not records: print("\n（無資料）"); return
-    if not compared:
-        seen,uniq=set(),[]
-        for r in records:
-            k=(r['mon'],r['tp'],r['ta'],r['fl'])
-            if k not in seen: seen.add(k); uniq.append(r)
-        records=uniq
-    path=os.path.join(os.path.dirname(os.path.abspath(__file__)),"records.json")
-    with open(path,"w",encoding="utf-8") as f: json.dump(records,f,ensure_ascii=False,indent=2)
-    print(f"\n💾 已輸出 {len(records)} 筆 → {path}")
-    if compared:
-        trust=[r for r in records if r.get('flag') in ('✓雙源一致','⚠僅5168')]
-        print(f"   👉 建議採用（一致＋僅5168）共 {len(trust)} 筆；其餘請先人工核對。")
-    print("📋 整段複製貼到「房產戰情室 → 行情估價 → 匯入框」：\n")
-    print(json.dumps(records, ensure_ascii=False))
+def output(records, name="records"):
+    if not records:
+        print("\n（無資料，沒有可輸出的內容）"); return
+    # 去重（同月＋同總價＋同坪＋同樓層 視為同一筆）
+    seen,uniq=set(),[]
+    for r in records:
+        k=(r.get('mon'),r.get('tp'),r.get('ta'),r.get('fl'))
+        if k not in seen: seen.add(k); uniq.append(r)
+    records=uniq
 
-# ========== 主程式 ==========
+    try: here=os.path.dirname(os.path.abspath(__file__))
+    except NameError: here=os.getcwd()
+    pretty=json.dumps(records, ensure_ascii=False, indent=2)
+    compact=json.dumps(records, ensure_ascii=False)
+    named=os.path.join(here, f"records_{safe_name(name)}_{datetime.date.today():%Y%m%d}.json")
+    fixed=os.path.join(here, "records.json")
+    for p in (named, fixed):
+        with open(p,"w",encoding="utf-8") as f: f.write(pretty)
+
+    print(f"\n💾 已輸出 {len(records)} 筆")
+    print(f"   • {named}   ←（存檔備查）")
+    print(f"   • {fixed}   ←（雲端 / 自動化固定名）")
+    summary(records)
+
+    if copy_clip(compact):
+        print("\n📋 已自動複製到剪貼簿！直接到「房產戰情室 → 行情估價 → 匯入框」貼上即可。")
+    else:
+        print("\n📋（沒裝 pyperclip，無法自動複製）請整段複製下面這串，貼到「行情估價 → 匯入框」：\n")
+        print(compact)
+
+# ======================= 主程式 =======================
 def main():
-    # 雲端/命令列模式：有給參數就直接跑，不進選單（GitHub Actions 用）
+    # 雲端 / 命令列：給參數就直接跑、不進選單（GitHub Actions 用）
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg:
         if arg.lower().endswith('.csv'):
-            output(parse_moi_csv(arg)); return
+            output(parse_moi_csv(arg), name="內政部CSV"); return
         if 'houseprice' in arg or arg.startswith('http'):
-            output(scrape_houseprice_url(arg)); return
+            mm=re.search(r'/building/(\d+)', arg)
+            output(scrape_houseprice_url(arg), name="5168_"+(mm.group(1) if mm else "cloud")); return
         print("⚠️ 參數無法辨識，請給 5168 社區網址或 .csv 路徑。"); return
-    print("="*60); print(f" 房產戰情室 · 抓取器 v3 交叉比對   (今 民國 {NOW_MINGUO} 年)"); print("="*60)
-    print("  1) 5168 社區名自動抓")
-    print("  2) 5168 社區網址抓")
-    print("  3) 內政部 OpenData CSV")
-    print("  4) 5168 × 樂居 交叉比對  ← 比對相符才放心")
-    print("  5) 純樂居（Selenium）")
-    c=input("輸入 1~5：").strip()
+
+    print("="*60)
+    print(f" 房產戰情室 · 抓取器 v4（5168 純淨版）   今 民國 {NOW_MINGUO} 年")
+    print("="*60)
+    print(" 【日常 · 5168 貼了就跑】")
+    print("   1) 社區名搜尋（會列候選給你挑）")
+    print("   2) 社區網址直接抓")
+    print(" 【整批 · 內政部（要先自己下載 CSV）】")
+    print("   3) 內政部 OpenData CSV")
+    c=input("\n輸入 1~3：").strip()
     if c=='1':
-        city=input("縣市(例 台中市)：").strip(); dist=input("行政區(可空白)：").strip(); name=input("社區名：").strip()
-        output(houseprice_by_name(name,city,dist))
+        city=input("縣市（例 台中市）：").strip()
+        dist=input("行政區（可空白）：").strip()
+        name=input("社區名：").strip()
+        recs,label=houseprice_by_name(name, city, dist)
+        output(recs, name=label)
     elif c=='2':
-        output(scrape_houseprice_url(input("5168 社區網址：").strip()))
+        output(scrape_houseprice_url(input("5168 社區網址：").strip()), name="5168")
     elif c=='3':
-        output(parse_moi_csv(input("CSV 路徑：").strip().strip('"')))
-    elif c=='4':
-        print("\n【交叉比對】先抓 5168，再抓樂居，自動比對。")
-        u5=input("5168 社區網址：").strip()
-        a=scrape_houseprice_url(u5)
-        ul=input("樂居 社區網址：").strip()
-        b=scrape_leju(ul)
-        output(cross_compare(a,b), compared=True)
-    elif c=='5':
-        output(scrape_leju(input("樂居 網址：").strip()))
+        output(parse_moi_csv(input("CSV 路徑：").strip().strip('"')), name="內政部CSV")
     else:
         print("未選擇，結束。")
 
