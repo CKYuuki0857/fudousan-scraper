@@ -1,6 +1,9 @@
 name: 抓實價登錄
 
-# 手動觸發：手機上按「Run workflow」就會跳出下面這幾格讓你填
+# ⚠️ 注意：5168 會封鎖 GitHub 機房 IP（HTTP 403），此 workflow 對 5168 多半會失敗。
+#    主力流程請用「電腦跑 scraper-V6.py → 自動上傳 records.json → 手機用戰情室雲端載入」。
+#    這支保留給：① 測試 ② 未來若改用不擋機房 IP 的來源 ③ 內政部 CSV 批次。
+
 on:
   workflow_dispatch:
     inputs:
@@ -43,6 +46,7 @@ jobs:
       - name: 安裝套件
         run: pip install requests beautifulsoup4
 
+      # --no-upload：雲端不必走 GitHub API 上傳，下一步的 git push 就會把檔案推回來
       - name: 執行抓取
         env:
           NAME: ${{ inputs.name }}
@@ -50,15 +54,20 @@ jobs:
           DIST: ${{ inputs.dist }}
           PICK: ${{ inputs.pick }}
           URL:  ${{ inputs.url }}
-        run: python scraper-V5.py
+        run: python scraper-V6.py --no-upload
 
       - name: 把結果推回倉庫
         run: |
           git config user.name  "github-actions"
           git config user.email "actions@github.com"
-          git add records.json candidates.json records_*.json 2>/dev/null || true
+          for f in records.json candidates.json; do
+            [ -f "$f" ] && git add "$f"
+          done
+          for f in records_*.json; do
+            [ -f "$f" ] && git add "$f"
+          done
           if git diff --staged --quiet; then
-            echo "沒有變更，不用 commit"
+            echo "沒有新資料（可能被 403 擋掉，或這次沒抓到東西），不用 commit"
           else
             git commit -m "抓取結果 $(date +'%Y-%m-%d %H:%M')"
             git push
