@@ -2,27 +2,38 @@
 # -*- coding: utf-8 -*-
 """
 ============================================================
- 房產戰情室 · 實價登錄抓取器 v4（5168 純淨版）
+ 房產戰情室 · 實價登錄抓取器 v5（5168 純淨版 · 支援手機/雲端「社區名搜尋」）
  永慶不動產 西屯安和創意店 · 李仕揚 · 0968-880183
 ------------------------------------------------------------
- v4 改版重點（拿掉樂居 / Selenium，把 5168 做到最順）：
-   ✓ 搜尋會「列候選清單」讓你挑，不會抓錯同名社區（惟美、昂峰…）
-   ✓ 全程免瀏覽器、免 webdriver —— 純 requests，貼了就跑
-   ✓ 跑完自動「複製到剪貼簿」（需 pip install pyperclip；沒裝就改成終端機列出）
-   ✓ 同時輸出兩份：
-       records_社區名_日期.json  ←（存檔備查）
-       records.json              ←（雲端 / 自動化固定名，不會被改名）
-   ✓ 跑完印一張「摘要」：筆數 / 單價中位數 / 樓層分布 / 最近成交月
-   ✓ 桌機、手機、雲端共用同一支：給參數(網址或 .csv)＝直接跑、不進選單（GitHub Actions 用）
-------------------------------------------------------------
- 模式：
-   【日常 · 5168 貼了就跑】
-     1) 社區名搜尋（會列候選給你挑）
-     2) 社區網址直接抓
-   【整批 · 內政部（要先自己下載 CSV）】
-     3) 內政部 OpenData CSV
+ v5 相對 v4 的唯一改動：把「社區名搜尋」也做成非互動模式，
+ 讓 GitHub Actions（手機）也能用社區名找，不必先自己去찾網址。
+ 解析邏輯（5168 / 內政部 CSV）與 v4 完全相同，未更動。
+
+ 用法：
+   桌機互動（跟 v4 一樣）：
+     python scraper-V5.py
+
+   直接抓網址（雲端也可）：
+     python scraper-V5.py "https://community.houseprice.tw/building/12345/"
+
+   內政部 CSV：
+     python scraper-V5.py "路徑.csv"
+
+   ★ 社區名搜尋（非互動，手機/雲端用）：
+     python scraper-V5.py --name 惟美 --city 台中市 --dist 西屯區 --pick 1
+       --pick 1  抓候選清單第 1 個（預設）
+       --pick 0  只列候選、不抓（先看有哪些社區，再決定要第幾個）
+
+   ★ 也可以用環境變數（GitHub Actions 填表比較好寫）：
+     NAME=惟美 CITY=台中市 DIST=西屯區 PICK=1 python scraper-V5.py
+
+ 產出：
+   records.json                    ←（固定名，給戰情室「☁️ 雲端載入」用）
+   records_社區名_日期.json         ←（存檔備查）
+   candidates.json                 ←（候選清單；挑錯時看這份，改 PICK 重跑）
+
  安裝：pip install requests beautifulsoup4
-       （選用）pip install pyperclip   ← 裝了才能「自動複製到剪貼簿」
+       （選用）pip install pyperclip   ← 桌機才需要，用來自動複製
 ============================================================
 """
 import os, sys, re, json, csv, datetime, urllib.parse, warnings
@@ -73,7 +84,7 @@ def fetch(url):
     r.encoding=r.apparent_encoding or 'utf-8'
     return r.status_code, r.text
 
-# ============== 5168 / houseprice 解析（沿用 v3 已測準，未更動） ==============
+# ============== 5168 / houseprice 解析（沿用 v3/v4 已測準，未更動） ==============
 def parse_houseprice_text(text):
     out=[]; matches=list(re.finditer(r'(\d{3})年(\d{1,2})月', text))
     for k,m in enumerate(matches):
@@ -99,7 +110,7 @@ def scrape_houseprice_url(url):
     out=parse_houseprice_text(BeautifulSoup(html,"html.parser").get_text(" "))
     print(f"   ✅ 解析出 {len(out)} 筆"); return out
 
-# ============== 5168 搜尋：改成「列候選清單」（修掉抓錯同名社區的風險） ==============
+# ============== 5168 搜尋：列候選清單 ==============
 def search_houseprice_candidates(name, city, district="", limit=8):
     base="https://community.houseprice.tw/list/"+urllib.parse.quote(city)+"_city/"
     if district: base+=urllib.parse.quote(district)+"_zip/"
@@ -121,17 +132,50 @@ def search_houseprice_candidates(name, city, district="", limit=8):
         if len(cands)>=limit: break
     return cands
 
-def houseprice_by_name(name, city, district=""):
-    """回傳 (records, 社區名標籤)。多筆會列清單讓使用者挑。"""
+def dump_candidates(cands, name, city, district):
+    """把候選清單寫成 candidates.json；挑錯時在手機上看這份，改 PICK 重跑。"""
+    try: here=os.path.dirname(os.path.abspath(__file__))
+    except NameError: here=os.getcwd()
+    data={"查詢":{"社區名":name,"縣市":city,"行政區":district},
+          "查詢時間":datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+          "說明":"若抓到的不是你要的社區，看下面 pick 編號，重跑一次並把 PICK 改成該編號。",
+          "候選":[{"pick":i+1,"社區名":c['name'],"網址":c['url']} for i,c in enumerate(cands)]}
+    with open(os.path.join(here,"candidates.json"),"w",encoding="utf-8") as f:
+        json.dump(data,f,ensure_ascii=False,indent=2)
+    print(f"   📝 候選清單已寫入 candidates.json（共 {len(cands)} 個）")
+
+def houseprice_by_name(name, city, district="", pick=None):
+    """
+    回傳 (records, 社區名標籤)。
+    pick=None → 互動模式（桌機，讓你用鍵盤選）
+    pick>=1   → 非互動，直接抓第 pick 個（手機/雲端）
+    pick==0   → 只列候選、不抓
+    """
     cands=search_houseprice_candidates(name, city, district)
     if not cands:
         print("   ⚠️ 沒找到，換個關鍵字或加上行政區再試。"); return [], name
-    if len(cands)==1:
-        c=cands[0]; print(f"   ✅ 只有一筆，直接抓：{c['name'] or c['url']}")
-        return scrape_houseprice_url(c['url']), (c['name'] or name)
+
     print(f"\n   找到 {len(cands)} 個社區：")
     for i,c in enumerate(cands,1):
         print(f"     {i}) {c['name'] or '(無名稱)'}   {c['url']}")
+    dump_candidates(cands, name, city, district)
+
+    # ── 非互動（手機 / 雲端）
+    if pick is not None:
+        if pick==0:
+            print("\n   （PICK=0：只列候選，不抓資料。決定好編號後，把 PICK 改成該編號重跑。）")
+            return [], name
+        idx=pick-1
+        if not (0<=idx<len(cands)):
+            print(f"   ⚠️ PICK={pick} 超出範圍（1~{len(cands)}），改抓第 1 個。"); idx=0
+        c=cands[idx]
+        print(f"\n   ▶ 依 PICK={idx+1} 抓取：{c['name'] or c['url']}")
+        return scrape_houseprice_url(c['url']), (c['name'] or name)
+
+    # ── 互動（桌機）
+    if len(cands)==1:
+        c=cands[0]; print(f"   ✅ 只有一筆，直接抓：{c['name'] or c['url']}")
+        return scrape_houseprice_url(c['url']), (c['name'] or name)
     sel=input("   選哪個？輸入編號（預設 1，輸 0 取消）：").strip() or "1"
     if sel=="0":
         print("   已取消。"); return [], name
@@ -143,7 +187,7 @@ def houseprice_by_name(name, city, district=""):
     c=cands[idx]
     return scrape_houseprice_url(c['url']), (c['name'] or name)
 
-# ============== 內政部 OpenData CSV（沿用 v3，未更動） ==============
+# ============== 內政部 OpenData CSV（沿用 v4，未更動） ==============
 def minguo_date_csv(s):
     if s is None: return ""
     d=re.sub(r'\D','',str(s))
@@ -229,7 +273,7 @@ def summary(records):
 
 # ======================= 剪貼簿 =======================
 def copy_clip(text):
-    """有裝 pyperclip 就自動複製；沒裝就回 False（改走終端機列出，不會塞亂碼進剪貼簿）。"""
+    """有裝 pyperclip 就自動複製；沒裝就回 False（改走終端機列出）。"""
     try:
         import pyperclip; pyperclip.copy(text); return True
     except Exception:
@@ -240,7 +284,7 @@ def safe_name(s):
     s=re.sub(r'[\\/:*?"<>|，、\s]+','_', (s or '').strip()).strip('_')
     return s or 'records'
 
-def output(records, name="records"):
+def output(records, name="records", quiet_clip=False):
     if not records:
         print("\n（無資料，沒有可輸出的內容）"); return
     # 去重（同月＋同總價＋同坪＋同樓層 視為同一筆）
@@ -264,26 +308,72 @@ def output(records, name="records"):
     print(f"   • {fixed}   ←（雲端 / 自動化固定名）")
     summary(records)
 
+    if quiet_clip:
+        print("\n☁️ 雲端模式：records.json 已更新，到戰情室按「☁️ 從雲端載入並匯入」即可。")
+        return
     if copy_clip(compact):
         print("\n📋 已自動複製到剪貼簿！直接到「房產戰情室 → 行情估價 → 匯入框」貼上即可。")
     else:
         print("\n📋（沒裝 pyperclip，無法自動複製）請整段複製下面這串，貼到「行情估價 → 匯入框」：\n")
         print(compact)
 
+# ======================= 參數解析 =======================
+def parse_args(argv):
+    """回傳 dict：{'mode':..., 'url'/'csv'/'name','city','dist','pick'}"""
+    a={'mode':None,'url':'','csv':'','name':'','city':'','dist':'','pick':None}
+    # 先看旗標式參數
+    i=0
+    while i < len(argv):
+        t=argv[i]
+        if t in ('--name','-n') and i+1<len(argv): a['name']=argv[i+1]; i+=2; continue
+        if t in ('--city','-c') and i+1<len(argv): a['city']=argv[i+1]; i+=2; continue
+        if t in ('--dist','--district','-d') and i+1<len(argv): a['dist']=argv[i+1]; i+=2; continue
+        if t in ('--pick','-p') and i+1<len(argv):
+            try: a['pick']=int(argv[i+1])
+            except: a['pick']=1
+            i+=2; continue
+        if t in ('--url','-u') and i+1<len(argv): a['url']=argv[i+1]; i+=2; continue
+        # 位置參數（相容 v4）
+        if not t.startswith('-'):
+            if t.lower().endswith('.csv'): a['csv']=t
+            elif t.startswith('http') or 'houseprice' in t: a['url']=t
+        i+=1
+    # 環境變數（GitHub Actions 好填）
+    a['name'] = a['name'] or os.environ.get('NAME','').strip()
+    a['city'] = a['city'] or os.environ.get('CITY','').strip()
+    a['dist'] = a['dist'] or os.environ.get('DIST','').strip()
+    a['url']  = a['url']  or os.environ.get('URL','').strip()
+    if a['pick'] is None:
+        pv=os.environ.get('PICK','').strip()
+        if pv:
+            try: a['pick']=int(pv)
+            except: a['pick']=1
+    if a['csv']: a['mode']='csv'
+    elif a['url']: a['mode']='url'
+    elif a['name']: a['mode']='name'
+    return a
+
 # ======================= 主程式 =======================
 def main():
-    # 雲端 / 命令列：給參數就直接跑、不進選單（GitHub Actions 用）
-    arg = sys.argv[1] if len(sys.argv) > 1 else ""
-    if arg:
-        if arg.lower().endswith('.csv'):
-            output(parse_moi_csv(arg), name="內政部CSV"); return
-        if 'houseprice' in arg or arg.startswith('http'):
-            mm=re.search(r'/building/(\d+)', arg)
-            output(scrape_houseprice_url(arg), name="5168_"+(mm.group(1) if mm else "cloud")); return
-        print("⚠️ 參數無法辨識，請給 5168 社區網址或 .csv 路徑。"); return
+    a=parse_args(sys.argv[1:])
 
+    # ── 非互動（雲端 / 手機 / 命令列）
+    if a['mode']=='csv':
+        output(parse_moi_csv(a['csv']), name="內政部CSV"); return
+    if a['mode']=='url':
+        mm=re.search(r'/building/(\d+)', a['url'])
+        output(scrape_houseprice_url(a['url']), name="5168_"+(mm.group(1) if mm else "cloud"),
+               quiet_clip=True); return
+    if a['mode']=='name':
+        city=a['city'] or '台中市'
+        pick=a['pick'] if a['pick'] is not None else 1
+        recs,label=houseprice_by_name(a['name'], city, a['dist'], pick=pick)
+        if pick==0: return          # 只列候選
+        output(recs, name=label, quiet_clip=True); return
+
+    # ── 互動選單（桌機，跟 v4 一樣）
     print("="*60)
-    print(f" 房產戰情室 · 抓取器 v4（5168 純淨版）   今 民國 {NOW_MINGUO} 年")
+    print(f" 房產戰情室 · 抓取器 v5（5168 純淨版）   今 民國 {NOW_MINGUO} 年")
     print("="*60)
     print(" 【日常 · 5168 貼了就跑】")
     print("   1) 社區名搜尋（會列候選給你挑）")
@@ -295,7 +385,7 @@ def main():
         city=input("縣市（例 台中市）：").strip()
         dist=input("行政區（可空白）：").strip()
         name=input("社區名：").strip()
-        recs,label=houseprice_by_name(name, city, dist)
+        recs,label=houseprice_by_name(name, city, dist)   # pick=None → 互動
         output(recs, name=label)
     elif c=='2':
         output(scrape_houseprice_url(input("5168 社區網址：").strip()), name="5168")
