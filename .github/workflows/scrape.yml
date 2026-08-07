@@ -1,26 +1,65 @@
 name: 抓實價登錄
+
+# 手動觸發：手機上按「Run workflow」就會跳出下面這幾格讓你填
 on:
   workflow_dispatch:
     inputs:
+      name:
+        description: '社區名（例：惟美）。填了就用社區名搜尋'
+        required: false
+        default: ''
+      city:
+        description: '縣市（例：台中市）'
+        required: false
+        default: '台中市'
+      dist:
+        description: '行政區（可空白，例：西屯區）'
+        required: false
+        default: ''
+      pick:
+        description: '要抓候選清單第幾個？1=第一個；0=只列清單不抓'
+        required: false
+        default: '1'
       url:
-        description: '5168 社區網址'
-        required: true
+        description: '（進階）直接給 5168 社區網址，填了就忽略上面的社區名'
+        required: false
+        default: ''
+
+permissions:
+  contents: write        # 一定要，否則結果推不回倉庫
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: 取出程式
+        uses: actions/checkout@v4
+
+      - name: 安裝 Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install requests beautifulsoup4
-      - run: python scraper.py "${{ github.event.inputs.url }}"
-      - name: 存回 repo
+
+      - name: 安裝套件
+        run: pip install requests beautifulsoup4
+
+      - name: 執行抓取
+        env:
+          NAME: ${{ inputs.name }}
+          CITY: ${{ inputs.city }}
+          DIST: ${{ inputs.dist }}
+          PICK: ${{ inputs.pick }}
+          URL:  ${{ inputs.url }}
+        run: python scraper-V5.py
+
+      - name: 把結果推回倉庫
         run: |
-          git config user.name "github-actions"
+          git config user.name  "github-actions"
           git config user.email "actions@github.com"
-          git add -f records.json
-          git commit -m "更新成交資料" || echo "無變動"
-          git push
+          git add records.json candidates.json records_*.json 2>/dev/null || true
+          if git diff --staged --quiet; then
+            echo "沒有變更，不用 commit"
+          else
+            git commit -m "抓取結果 $(date +'%Y-%m-%d %H:%M')"
+            git push
+          fi
